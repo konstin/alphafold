@@ -16,6 +16,7 @@
 
 import collections
 import functools
+import os
 from typing import List, Mapping, Tuple
 
 import numpy as np
@@ -400,9 +401,9 @@ def load_stereo_chemical_props() -> Tuple[Mapping[str, List[Bond]],
   ("residue_virtual_bonds").
 
   Returns:
-    residue_bonds:  dict that maps resname --> list of Bond tuples
-    residue_virtual_bonds: dict that maps resname --> list of Bond tuples
-    residue_bond_angles: dict that maps resname --> list of BondAngle tuples
+    residue_bonds: Dict that maps resname -> list of Bond tuples.
+    residue_virtual_bonds: Dict that maps resname -> list of Bond tuples.
+    residue_bond_angles: Dict that maps resname -> list of BondAngle tuples.
   """
   with open(stereo_chemical_props_path, 'rt') as f:
     stereo_chemical_props = f.read()

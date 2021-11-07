@@ -26,6 +26,10 @@ CHAIN_IDs = ascii_uppercase+ascii_lowercase
 FeatureDict = Mapping[str, np.ndarray]
 ModelOutput = Mapping[str, Any]  # Is a nested dict.
 
+# Complete sequence of chain IDs supported by the PDB format.
+PDB_CHAIN_IDS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+PDB_MAX_CHAINS = len(PDB_CHAIN_IDS)  # := 62.
+
 
 @dataclasses.dataclass(frozen=True)
 class Protein:
@@ -46,24 +50,30 @@ class Protein:
   # Residue index as used in PDB. It is not necessarily continuous or 0-indexed.
   residue_index: np.ndarray  # [num_res]
 
+  # 0-indexed number corresponding to the chain in the protein that this residue
+  # belongs to.
+  chain_index: np.ndarray  # [num_res]
+
   # B-factors, or temperature factors, of each residue (in sq. angstroms units),
   # representing the displacement of the residue from its ground truth mean
   # value.
   b_factors: np.ndarray  # [num_res, num_atom_type]
 
+  def __post_init__(self):
+    if len(np.unique(self.chain_index)) > PDB_MAX_CHAINS:
+      raise ValueError(
+          f'Cannot build an instance with more than {PDB_MAX_CHAINS} chains '
+          'because these cannot be written to PDB format.')
+
 
 def from_pdb_string(pdb_str: str, chain_id: Optional[str] = None) -> Protein:
   """Takes a PDB string and constructs a Protein object.
-
   WARNING: All non-standard residue types will be converted into UNK. All
     non-standard atoms will be ignored.
-
   Args:
     pdb_str: The contents of the pdb file
-    chain_id: If None, then the pdb file must contain a single chain (which
-      will be parsed). If chain_id is specified (e.g. A), then only that chain
-      is parsed.
-
+    chain_id: If chain_id is specified (e.g. A), then only that chain
+      is parsed. Otherwise all chains are parsed.
   Returns:
     A new `Protein` parsed from the pdb contents.
   """
@@ -76,27 +86,16 @@ def from_pdb_string(pdb_str: str, chain_id: Optional[str] = None) -> Protein:
         f'Only single model PDBs are supported. Found {len(models)} models.')
   model = models[0]
 
-  if chain_id is not None:
-    chain = model[chain_id]
-    chains = [chain]
-  else:
-    chains = list(model.get_chains())
-  #  if len(chains) != 1:
-  #    raise ValueError(
-  #        'Only single chain PDBs are supported when chain_id not specified. '
-  #        f'Found {len(chains)} chains.')
-  #  else:
-  #    chain = chains[0]
-
   atom_positions = []
   aatype = []
   atom_mask = []
   residue_index = []
+  chain_ids = []
   b_factors = []
 
-  PARAM_CHAIN_BREAK = 100
-  residue_index_prev = 0
-  for k,chain in enumerate(chains):
+  for chain in model:
+    if chain_id is not None and chain.id != chain_id:
+      continue
     for res in chain:
       if res.id[2] != ' ':
         raise ValueError(
@@ -120,24 +119,34 @@ def from_pdb_string(pdb_str: str, chain_id: Optional[str] = None) -> Protein:
       aatype.append(restype_idx)
       atom_positions.append(pos)
       atom_mask.append(mask)
-      residue_index.append(res.id[1] + residue_index_prev + PARAM_CHAIN_BREAK*k)
+      residue_index.append(res.id[1])
+      chain_ids.append(chain.id)
       b_factors.append(res_b_factors)
-    residue_index_prev = residue_index[-1]
+
+  # Chain IDs are usually characters so map these to ints.
+  unique_chain_ids = np.unique(chain_ids)
+  chain_id_mapping = {cid: n for n, cid in enumerate(unique_chain_ids)}
+  chain_index = np.array([chain_id_mapping[cid] for cid in chain_ids])
 
   return Protein(
       atom_positions=np.array(atom_positions),
       atom_mask=np.array(atom_mask),
       aatype=np.array(aatype),
       residue_index=np.array(residue_index),
+      chain_index=chain_index,
       b_factors=np.array(b_factors))
+      
+
+def _chain_end(atom_index, end_resname, chain_name, residue_index) -> str:
+  chain_end = 'TER'
+  return (f'{chain_end:<6}{atom_index:>5}      {end_resname:>3} '
+          f'{chain_name:>1}{residue_index:>4}')
 
 
 def to_pdb(prot: Protein) -> str:
   """Converts a `Protein` instance to a PDB string.
-
   Args:
     prot: The protein to convert to PDB.
-
   Returns:
     PDB string.
   """
@@ -201,9 +210,7 @@ def to_pdb(prot: Protein) -> str:
       f'{chain_end:<6}{atom_index:>5}      {res_1to3(aatype[-1]):>3} '
       f'{chain_id:>1}{residue_index[-1]:>4}')
   pdb_lines.append(chain_termination_line)
-  
-
-  
+    
   pdb_lines.append('')
   return '\n'.join(pdb_lines)
 
@@ -224,25 +231,40 @@ def ideal_atom_mask(prot: Protein) -> np.ndarray:
   return residue_constants.STANDARD_ATOM_MASK[prot.aatype]
 
 
-def from_prediction(features: FeatureDict, result: ModelOutput,
-                    b_factors: Optional[np.ndarray] = None) -> Protein:
+def from_prediction(
+    features: FeatureDict,
+    result: ModelOutput,
+    b_factors: Optional[np.ndarray] = None,
+    remove_leading_feature_dimension: bool = True) -> Protein:
   """Assembles a protein from a prediction.
 
   Args:
     features: Dictionary holding model inputs.
     result: Dictionary holding model outputs.
     b_factors: (Optional) B-factors to use for the protein.
+    remove_leading_feature_dimension: Whether to remove the leading dimension
+      of the `features` values.
 
   Returns:
     A protein instance.
   """
   fold_output = result['structure_module']
+
+  def _maybe_remove_leading_dim(arr: np.ndarray) -> np.ndarray:
+    return arr[0] if remove_leading_feature_dimension else arr
+
+  if 'asym_id' in features:
+    chain_index = _maybe_remove_leading_dim(features['asym_id'])
+  else:
+    chain_index = np.zeros_like(_maybe_remove_leading_dim(features['aatype']))
+
   if b_factors is None:
     b_factors = np.zeros_like(fold_output['final_atom_mask'])
 
   return Protein(
-      aatype=features['aatype'][0],
+      aatype=_maybe_remove_leading_dim(features['aatype']),
       atom_positions=fold_output['final_atom_positions'],
       atom_mask=fold_output['final_atom_mask'],
-      residue_index=features['residue_index'][0] + 1,
+      residue_index=_maybe_remove_leading_dim(features['residue_index']) + 1,
+      chain_index=chain_index,
       b_factors=b_factors)
